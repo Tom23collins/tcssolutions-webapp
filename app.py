@@ -1,107 +1,65 @@
-from flask import Flask, redirect, render_template, url_for, request, flash
-import flask_login
-from db import db_query_values, db_update
+__version__ = "1.0.0"
+
+import identity.web
+import requests
+from flask import Flask, redirect, render_template, request, session, url_for
+from flask_session import Session
+
 import config
-import os
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
-from scripts import send_welcome_email
-from flask_mail import Mail
+from db import db_query, db_update
 
 app = Flask(__name__)
 app.config.from_object(config)
-mail = Mail(app)
+assert app.config["REDIRECT_PATH"] != "/", "REDIRECT_PATH must not be /"
+Session(app)
 
-if os.getenv('FLASK_ENV') == 'development':
-    app.config['DEBUG'] = True
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-class User(flask_login.UserMixin):
-    def __init__(self, user_data):
-        self.id = user_data[0]            # id
-        self.email = user_data[1]         # email
-        self.password = user_data[2]      # password
-        self.first_name = user_data[3]    # first_name
-        self.last_name = user_data[4]     # last_name
-        self.user_role = user_data[6]     # user_role
+app.jinja_env.globals.update(Auth=identity.web.Auth)
+auth = identity.web.Auth(
+    session=session,
+    authority=app.config["AUTHORITY"],
+    client_id=app.config["CLIENT_ID"],
+    client_credential=app.config["CLIENT_SECRET"],
+)
 
-login_manager = flask_login.LoginManager()
-login_manager.init_app(app)
-
-def role_required(role):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            if not flask_login.current_user.is_authenticated:
-                flash("You need to be logged in to access this page.")
-                return redirect(url_for('login'))
-
-            if flask_login.current_user.user_role == 'administrator':
-                return f(*args, **kwargs)
-
-            if flask_login.current_user.user_role != role:
-                flash("You don't have the required role to access this page.")
-                return redirect(url_for('index'))
-
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-@login_manager.user_loader
-def user_loader(user_id):
-    user_data = db_query_values(app, 'SELECT * FROM users WHERE id = %s', (user_id,))
-    if not user_data:
-        return None
-    return User(user_data[0])
-
-@app.route('/')
-def index():
-    return render_template('index.html', user=flask_login.current_user)
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'GET':
-        return render_template('register.html')
-
-    sql = """
-    INSERT INTO users (`email`, `password`, `first_name`, `last_name`)
-    VALUES (%s, %s, %s, %s)
-    """
-    values = (
-        request.form['email'],
-        generate_password_hash(request.form['password']),
-        request.form['first_name'],
-        request.form['last_name'],
-    )
-
-    db_update(app, sql, values)
-    send_welcome_email(app, mail, request.form['email'], request.form['first_name'])
-    return redirect(url_for('login'))
-
-@app.route('/login', methods=['GET', 'POST'])
+@app.route("/")
 def login():
-    if request.method == 'GET':
-        return render_template('login.html')
+    return render_template("auth/login.html", version=__version__, **auth.log_in(
+        scopes=config.SCOPE, # Have user consent to scopes during log-in
+        redirect_uri=url_for("auth_response", _external=True), # Optional. If present, this absolute URL must match your app's redirect_uri registered in Microsoft Entra admin center
+        ))
 
-    email = request.form['email']
-    password = request.form['password']
+@app.route(config.REDIRECT_PATH)
+def auth_response():
+    result = auth.complete_log_in(request.args)
+    if "error" in result:
+        return render_template("auth_error.html", result=result)
+    return redirect(url_for("index"))
 
-    user_data = db_query_values(app, 'SELECT * FROM users WHERE email = %s', (email,))
-    if user_data and check_password_hash(user_data[0][2], password):
-        user = User(user_data[0])
-        flask_login.login_user(user)
-        return redirect(url_for('index'))
-
-    error = "Invalid email or password."
-    return render_template('login.html', error=error)
-
-@app.route('/logout')
+@app.route("/logout")
 def logout():
-    flask_login.logout_user()
-    return redirect(url_for('index'))
+    return redirect(auth.log_out(url_for("index", _external=True)))
 
-@login_manager.unauthorized_handler
-def unauthorized_handler():
-    return redirect(url_for('login'))
+@app.route("/dashboard")
+def index():
+    if not auth.get_user():
+        return redirect(url_for("login"))
+    return render_template('index.html', user=auth.get_user(), version=__version__)
+
+@app.route("/call_downstream_api")
+def call_downstream_api():
+    token = auth.get_token_for_user(config.SCOPE)
+    if "error" in token:
+        return redirect(url_for("login"))
+    # Use access token to call downstream api
+    api_result = requests.get(
+        config.ENDPOINT,
+        headers={'Authorization': 'Bearer ' + token['access_token']},
+        timeout=30,
+    ).json()
+    return render_template('auth/display.html', result=api_result)
 
 if __name__ == "__main__":
     app.run()
